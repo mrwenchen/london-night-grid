@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>City of London — Neon Grid</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#04050c;font-family:'SF Mono',Menlo,Consolas,monospace}
+  #hud{position:fixed;top:18px;left:22px;color:#7de3ff;pointer-events:none;text-shadow:0 0 12px rgba(60,220,255,.55);z-index:2}
+  #hud h1{font-size:15px;letter-spacing:.35em;margin:0 0 6px;font-weight:600;color:#c8f4ff}
+  #hud div{font-size:11px;letter-spacing:.12em;color:#5fb8d9;opacity:.85}
+  #hint{position:fixed;bottom:16px;left:22px;font-size:10px;letter-spacing:.15em;color:#3f7f9c;z-index:2;pointer-events:none}
+  #tag{position:fixed;bottom:16px;right:22px;font-size:10px;letter-spacing:.15em;color:#7a4f9c;z-index:2;pointer-events:none}
+  canvas{display:block}
+</style>
+</head>
+<body>
+<div id="hud">
+  <h1>CITY OF LONDON — NEON GRID</h1>
+  <div id="stats">LOADING…</div>
+</div>
+<div id="hint">DRAG ROTATE · WHEEL ZOOM · RIGHT-DRAG PAN</div>
+<div id="tag">OSM DATA · BUILT WITH CLAUDE</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const DATA = __SCENE_DATA__;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x04050c);
+scene.fog = new THREE.FogExp2(0x04050c, 0.00075);
+
+const camera = new THREE.PerspectiveCamera(55, innerWidth/innerHeight, 1, 12000);
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+// ---------- buildings: merged mesh with custom neon shader ----------
+const pos=[], nrm=[], hAttr=[];
+function addTri(ax,ay,az,bx,by,bz,cx,cy,cz,nx,ny,nz,h){
+  pos.push(ax,ay,az,bx,by,bz,cx,cy,cz);
+  nrm.push(nx,ny,nz,nx,ny,nz,nx,ny,nz);
+  hAttr.push(h,h,h);
+}
+let maxH=1;
+for(const b of DATA.buildings) maxH=Math.max(maxH,b[0]);
+for(const b of DATA.buildings){
+  const h=b[0], f=b[1], n=f.length/2;
+  if(n<3) continue;
+  const v2=[];
+  for(let i=0;i<n;i++) v2.push(new THREE.Vector2(f[2*i], -f[2*i+1]));
+  // walls
+  for(let i=0;i<n;i++){
+    const a=v2[i], c=v2[(i+1)%n];
+    const dx=c.x-a.x, dz=c.y-a.y, len=Math.hypot(dx,dz)||1;
+    const nx=dz/len, nz=-dx/len;
+    addTri(a.x,0,a.y, c.x,0,c.y, c.x,h,c.y, nx,0,nz, h);
+    addTri(a.x,0,a.y, c.x,h,c.y, a.x,h,a.y, nx,0,nz, h);
+  }
+  // roof
+  try{
+    const tris=THREE.ShapeUtils.triangulateShape(v2,[]);
+    for(const t of tris){
+      const p0=v2[t[0]], p1=v2[t[1]], p2=v2[t[2]];
+      addTri(p0.x,h,p0.y, p1.x,h,p1.y, p2.x,h,p2.y, 0,1,0, h);
+    }
+  }catch(e){}
+}
+const geo=new THREE.BufferGeometry();
+geo.setAttribute('position', new THREE.Float32BufferAttribute(pos,3));
+geo.setAttribute('normal', new THREE.Float32BufferAttribute(nrm,3));
+geo.setAttribute('aH', new THREE.Float32BufferAttribute(hAttr,1));
+
+const uniforms=Object.assign(
+  THREE.UniformsUtils.clone(THREE.UniformsLib.fog),
+  { uTime:{value:0}, uMaxH:{value:maxH} });
+const mat=new THREE.ShaderMaterial({
+  uniforms,
+  fog:true,
+  vertexShader:`
+    attribute float aH;
+    varying vec3 vPos; varying vec3 vNrm; varying float vH;
+    ${THREE.ShaderChunk.fog_pars_vertex}
+    void main(){
+      vPos=position; vNrm=normal; vH=aH;
+      vec4 mvPosition=modelViewMatrix*vec4(position,1.0);
+      gl_Position=projectionMatrix*mvPosition;
+      ${THREE.ShaderChunk.fog_vertex}
+    }`,
+  fragmentShader:`
+    uniform float uTime; uniform float uMaxH;
+    varying vec3 vPos; varying vec3 vNrm; varying float vH;
+    ${THREE.ShaderChunk.fog_pars_fragment}
+    void main(){
+      float t=clamp(vH/uMaxH,0.0,1.0); t=pow(t,0.55);
+      vec3 low=vec3(0.10,0.22,0.45);
+      vec3 mid=vec3(0.10,0.60,0.90);
+      vec3 hi =vec3(1.00,0.32,0.85);
+      vec3 base=mix(low, mix(mid,hi,smoothstep(0.45,1.0,t)), t);
+      vec3 n=normalize(vNrm);
+      // directional key light + fill: each facade gets its own brightness
+      float diff=max(dot(n,normalize(vec3(0.55,0.75,0.35))),0.0);
+      float fill=max(dot(n,normalize(vec3(-0.6,0.2,-0.7))),0.0);
+      float shade=0.30+0.85*diff+0.30*fill;
+      float vert=clamp(vPos.y/max(vH,1.0),0.0,1.0);
+      base*=shade*(0.65+0.40*vert);
+      // roofs slightly lifted so tops read as caps
+      if(n.y>0.9) base*=1.25;
+      // window stripes on walls (vertical floors + horizontal bays)
+      float isWall=1.0-step(0.9,abs(n.y));
+      float floors=step(0.5,fract(vPos.y*0.28));
+      float bays=step(0.35,fract((vPos.x-vPos.z)*0.18));
+      base+=vec3(0.12,0.34,0.42)*floors*bays*isWall*0.5;
+      // rising scan pulse
+      float scan=exp(-40.0*abs(vPos.y-mod(uTime*28.0,uMaxH*1.15))/uMaxH);
+      base+=vec3(0.3,0.9,1.0)*scan*0.9;
+      // rim glow toward camera
+      float rim=pow(1.0-abs(dot(n,normalize(cameraPosition-vPos))),3.0);
+      base+=vec3(0.15,0.5,0.7)*rim*0.5;
+      gl_FragColor=vec4(base,1.0);
+      ${THREE.ShaderChunk.fog_fragment}
+    }`
+});
+scene.add(new THREE.Mesh(geo,mat));
+// tron-style edge outlines so footprint shapes read clearly
+const edgeGeo=new THREE.EdgesGeometry(geo,20);
+scene.add(new THREE.LineSegments(edgeGeo,
+  new THREE.LineBasicMaterial({color:0x49e6ff,transparent:true,opacity:0.30,blending:THREE.AdditiveBlending,fog:true})));
+
+// ---------- roads: additive glowing lines ----------
+const rp=[];
+for(const r of DATA.roads){
+  const n=r.length/2;
+  for(let i=0;i<n-1;i++) rp.push(r[2*i],0.4,-r[2*i+1], r[2*i+2],0.4,-r[2*i+3]);
+}
+const rgeo=new THREE.BufferGeometry();
+rgeo.setAttribute('position', new THREE.Float32BufferAttribute(rp,3));
+const rmat=new THREE.LineBasicMaterial({color:0x27c8ff, transparent:true, opacity:0.55, blending:THREE.AdditiveBlending, fog:true});
+scene.add(new THREE.LineSegments(rgeo,rmat));
+
+// ground + faint grid
+const ground=new THREE.Mesh(new THREE.PlaneGeometry(9000,9000), new THREE.MeshBasicMaterial({color:0x05060f}));
+ground.rotation.x=-Math.PI/2; ground.position.y=-0.5; scene.add(ground);
+const grid=new THREE.GridHelper(6000,120,0x0e2233,0x0a1626);
+grid.position.y=-0.2; scene.add(grid);
+
+// ---------- minimal orbit controls ----------
+const target=new THREE.Vector3(150,60,-300);
+let radius=1500, theta=-0.6, phi=1.12, auto=true;
+function applyCam(){
+  camera.position.set(
+    target.x+radius*Math.sin(phi)*Math.sin(theta),
+    target.y+radius*Math.cos(phi),
+    target.z+radius*Math.sin(phi)*Math.cos(theta));
+  camera.lookAt(target);
+}
+let drag=null;
+addEventListener('contextmenu',e=>e.preventDefault());
+addEventListener('mousedown',e=>{drag={x:e.clientX,y:e.clientY,b:e.button};auto=false;});
+addEventListener('mouseup',()=>drag=null);
+addEventListener('mousemove',e=>{
+  if(!drag) return;
+  const dx=e.clientX-drag.x, dy=e.clientY-drag.y; drag.x=e.clientX; drag.y=e.clientY;
+  if(drag.b===2){
+    const s=radius*0.0012;
+    const fwd=new THREE.Vector3().subVectors(target,camera.position); fwd.y=0; fwd.normalize();
+    const right=new THREE.Vector3(fwd.z,0,-fwd.x);
+    target.addScaledVector(right,dx*s).addScaledVector(fwd,dy*s);
+  } else {
+    theta-=dx*0.005; phi=Math.min(1.52,Math.max(0.15,phi-dy*0.004));
+  }
+});
+addEventListener('wheel',e=>{radius=Math.min(6000,Math.max(120,radius*(1+Math.sign(e.deltaY)*0.09)));auto=false;},{passive:true});
+addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);});
+
+document.getElementById('stats').textContent =
+  `${DATA.buildings.length} BUILDINGS · ${DATA.roads.length} ROAD SEGMENTS · MAX ${Math.round(maxH)}M (THE SHARD)`;
+
+const clock=new THREE.Clock();
+(function loop(){
+  requestAnimationFrame(loop);
+  uniforms.uTime.value=clock.getElapsedTime();
+  if(auto) theta+=0.0012;
+  applyCam();
+  renderer.render(scene,camera);
+})();
+</script>
+</body>
+</html>

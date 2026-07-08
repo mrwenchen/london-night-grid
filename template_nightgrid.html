@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>London // night grid</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#07090c;
+    font-family:'Helvetica Neue',Arial,sans-serif;font-size:13px;color:#e8ebef}
+  #panel{position:fixed;top:16px;left:16px;z-index:5;background:rgba(13,16,21,.85);
+    border:1px solid #232a35;border-radius:12px;padding:14px 16px;backdrop-filter:blur(10px);
+    -webkit-backdrop-filter:blur(10px);min-width:230px}
+  #panel h1{font-size:14px;margin:0 0 4px;font-weight:600;letter-spacing:.02em}
+  #panel .muted{color:#8b95a3;font-size:12px}
+  #legend{height:8px;border-radius:4px;margin:10px 0 3px;
+    background:linear-gradient(90deg,#1b2b4a,#7484a6 45%,#9fd8e8 75%,#eaffff)}
+  #legendlbl{display:flex;justify-content:space-between;color:#8b95a3;font-size:10.5px;margin-bottom:8px}
+  label{display:flex;align-items:center;gap:7px;margin:5px 0;cursor:pointer;user-select:none}
+  input[type=checkbox]{accent-color:#ff2d95;width:14px;height:14px}
+  #hint{color:#8b95a3;font-size:11px;margin-top:9px}
+  canvas{display:block}
+</style>
+</head>
+<body>
+<div id="panel">
+  <h1>London // night grid</h1>
+  <div class="muted" id="counts">loading…</div>
+  <div id="legend"></div>
+  <div id="legendlbl"><span>6 m</span><span>height (log)</span><span>320 m+</span></div>
+  <label><input type="checkbox" id="cbBloom" checked> Bloom glow</label>
+  <label><input type="checkbox" id="cbScan" checked> Floor scanlines</label>
+  <label><input type="checkbox" id="cbPulse" checked> City pulse</label>
+  <div id="hint">drag rotate · right-drag pan · scroll zoom</div>
+</div>
+<script src="https://unpkg.com/three@0.147.0/build/three.min.js"></script>
+<script src="https://unpkg.com/three@0.147.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://unpkg.com/three@0.147.0/examples/js/postprocessing/Pass.js"></script>
+<script src="https://unpkg.com/three@0.147.0/examples/js/postprocessing/MaskPass.js"></script>
+<script src="https://unpkg.com/three@0.147.0/examples/js/shaders/CopyShader.js"></script>
+<script src="https://unpkg.com/three@0.147.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
+<script src="https://unpkg.com/three@0.147.0/examples/js/postprocessing/EffectComposer.js"></script>
+<script src="https://unpkg.com/three@0.147.0/examples/js/postprocessing/RenderPass.js"></script>
+<script src="https://unpkg.com/three@0.147.0/examples/js/postprocessing/ShaderPass.js"></script>
+<script src="https://unpkg.com/three@0.147.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
+<script>
+const P = __PAYLOAD__;
+
+// ---------- decode packed payload ----------
+function b64(s, T){
+  const bin=atob(s), u=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i);
+  return new T(u.buffer);
+}
+const S=P.meta.scale;
+const bLens=b64(P.bLens,Uint16Array), bRole=b64(P.bRole,Uint8Array),
+      bRings=b64(P.bRings,Uint8Array), bStarts=b64(P.bStarts,Int32Array),
+      bDeltas=b64(P.bDeltas,Int16Array), bH=b64(P.bH,Float32Array),
+      rLens=b64(P.rLens,Uint16Array), rStarts=b64(P.rStarts,Int32Array),
+      rDeltas=b64(P.rDeltas,Int16Array);
+
+function unpack(lens, starts, deltas){
+  const out=[]; let si=0, di=0;
+  for(let r=0;r<lens.length;r++){
+    const n=lens[r], pts=new Float32Array(n*2);
+    let x=starts[si++], y=starts[si++];
+    pts[0]=x/S; pts[1]=y/S;
+    for(let i=1;i<n;i++){ x+=deltas[di++]; y+=deltas[di++]; pts[2*i]=x/S; pts[2*i+1]=y/S; }
+    out.push(pts);
+  }
+  return out;
+}
+const ringPts=unpack(bLens,bStarts,bDeltas);
+const roadPts=unpack(rLens,rStarts,rDeltas);
+
+// scene center
+let minX=1e9,maxX=-1e9,minY=1e9,maxY=-1e9;
+for(const arr of ringPts) for(let i=0;i<arr.length;i+=2){
+  if(arr[i]<minX)minX=arr[i]; if(arr[i]>maxX)maxX=arr[i];
+  if(arr[i+1]<minY)minY=arr[i+1]; if(arr[i+1]>maxY)maxY=arr[i+1];
+}
+const cx=(minX+maxX)/2, cy=(minY+maxY)/2;
+const W=(x)=>x-cx, D=(y)=>-(y-cy);   // map (x,y) -> (x,-y)
+
+// ---------- height ramp (log scale, exact stops) ----------
+const stops=[[0.00,0x1b,0x2b,0x4a],[0.45,0x74,0x84,0xa6],[0.75,0x9f,0xd8,0xe8],[1.00,0xea,0xff,0xff]];
+function ramp(h){
+  const t=Math.min(1,Math.max(0,Math.log(Math.max(h,6)/6)/Math.log(320/6)));
+  for(let i=1;i<stops.length;i++){
+    if(t<=stops[i][0]){
+      const a=stops[i-1], b=stops[i], f=(t-a[0])/(b[0]-a[0]);
+      return [a[1]+(b[1]-a[1])*f, a[2]+(b[2]-a[2])*f, a[3]+(b[3]-a[3])*f];
+    }
+  }
+  return [stops[3][1],stops[3][2],stops[3][3]];
+}
+const sun=(()=>{const l=Math.hypot(-0.55,0.75);return [-0.55/l,0.75/l];})();
+
+// ---------- build merged geometry ----------
+const pos=[], col=[], nrm=[];
+function vert(x,y,z, r,g,b, nx,ny,nz){
+  pos.push(x,y,z); col.push(r,g,b);
+  nrm.push(Math.round(nx*127),Math.round(ny*127),Math.round(nz*127));
+}
+let ri=0, tris=0;
+for(let bi=0;bi<P.meta.nBld;bi++){
+  const nr=bRings[bi];
+  let h=bH[bi]; if(!(h>0.5)) h=8;
+  const base=ramp(h);
+  const outer=[], holes=[];
+  for(let k=0;k<nr;k++){
+    const arr=ringPts[ri], role=bRole[ri]; ri++;
+    const n=arr.length/2;
+    // walls
+    for(let i=0;i<n;i++){
+      const j=(i+1)%n;
+      const ax=W(arr[2*i]), az=D(arr[2*i+1]), bx=W(arr[2*j]), bz=D(arr[2*j+1]);
+      const ex=bx-ax, ez=bz-az, el=Math.hypot(ex,ez)||1;
+      const nx=ez/el, nz=-ex/el;
+      // lambert with plan-space sun (map back: plan y = -z)
+      const lam=0.42+0.58*Math.max(0, nx*sun[0]+(-nz)*sun[1]);
+      const r=base[0]*lam, g=base[1]*lam, b=base[2]*lam;
+      vert(ax,0,az, r,g,b, nx,0,nz); vert(bx,0,bz, r,g,b, nx,0,nz); vert(bx,h,bz, r,g,b, nx,0,nz);
+      vert(ax,0,az, r,g,b, nx,0,nz); vert(bx,h,bz, r,g,b, nx,0,nz); vert(ax,h,az, r,g,b, nx,0,nz);
+      tris+=2;
+    }
+    const v2=[];
+    for(let i=0;i<n;i++) v2.push(new THREE.Vector2(W(arr[2*i]), D(arr[2*i+1])));
+    if(role===0){ if(outer.length===0) outer.push(v2); else outer.push(v2); }
+    else holes.push(v2);
+  }
+  // roofs (first outer + holes; extra outers triangulated alone)
+  const rr=Math.min(255,base[0]*1.15), rg=Math.min(255,base[1]*1.15), rb=Math.min(255,base[2]*1.15);
+  for(let oi=0;oi<outer.length;oi++){
+    const hs=oi===0?holes:[];
+    let t;
+    try{ t=THREE.ShapeUtils.triangulateShape(outer[oi],hs); }catch(e){ continue; }
+    const all=outer[oi].concat(...hs);
+    for(const tri of t){
+      const p0=all[tri[0]],p1=all[tri[1]],p2=all[tri[2]];
+      vert(p0.x,h,p0.y, rr,rg,rb, 0,1,0); vert(p1.x,h,p1.y, rr,rg,rb, 0,1,0); vert(p2.x,h,p2.y, rr,rg,rb, 0,1,0);
+      tris++;
+    }
+  }
+}
+const geo=new THREE.BufferGeometry();
+geo.setAttribute('position', new THREE.Float32BufferAttribute(pos,3));
+geo.setAttribute('color', new THREE.BufferAttribute(new Uint8Array(col),3,true));
+geo.setAttribute('normal', new THREE.BufferAttribute(new Int8Array(nrm),3,true));
+
+// ---------- renderer / scene ----------
+const scene=new THREE.Scene();
+scene.background=new THREE.Color(0x07090c);
+scene.fog=new THREE.Fog(0x07090c, 2500, 9000);
+const camera=new THREE.PerspectiveCamera(55, innerWidth/innerHeight, 1, 20000);
+camera.position.set(900, 750, 1200);
+const renderer=new THREE.WebGLRenderer({antialias:true, powerPreference:'high-performance'});
+renderer.setSize(innerWidth,innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio,1.75));
+document.body.appendChild(renderer.domElement);
+
+const uniforms=Object.assign(THREE.UniformsUtils.clone(THREE.UniformsLib.fog),{
+  uTime:{value:0}, uScan:{value:1}, uPulse:{value:1}, uCam:{value:new THREE.Vector3()}
+});
+const bldMat=new THREE.ShaderMaterial({
+  uniforms, vertexColors:true, transparent:true, depthWrite:true, side:THREE.DoubleSide, fog:true,
+  vertexShader:`
+    varying vec3 vW; varying vec3 vN; varying vec3 vC;
+    #include <fog_pars_vertex>
+    void main(){
+      vW=position; vN=normal; vC=color;
+      vec4 mvPosition=modelViewMatrix*vec4(position,1.0);
+      gl_Position=projectionMatrix*mvPosition;
+      #include <fog_vertex>
+    }`,
+  fragmentShader:`
+    uniform float uTime,uScan,uPulse; uniform vec3 uCam;
+    varying vec3 vW; varying vec3 vN; varying vec3 vC;
+    #include <fog_pars_fragment>
+    void main(){
+      vec3 c=vC;
+      float wall=step(abs(vN.y),0.6);
+      float fl=fract(vW.y/3.0);
+      float band=smoothstep(0.55,0.35,fl)*smoothstep(0.05,0.25,fl);
+      c+=uScan*wall*band*vec3(0.10,0.22,0.30);
+      float fr=pow(1.0-abs(dot(normalize(vN),normalize(uCam-vW))),2.6);
+      c+=fr*vec3(0.18,0.55,0.70)*0.9;
+      float d=length(vW.xz);
+      float ph=mod(d-uTime*220.0,2800.0);
+      float w=exp(-abs(ph-200.0)/110.0);
+      c+=uPulse*w*mix(vec3(0.15,0.5,0.6),vec3(0.65,0.12,0.45),0.5+0.5*sin(uTime*0.7))*0.5;
+      gl_FragColor=vec4(c,0.93);
+      #include <fog_fragment>
+    }`
+});
+scene.add(new THREE.Mesh(geo,bldMat));
+
+// ---------- roads ----------
+const rp=[];
+for(const arr of roadPts){
+  const n=arr.length/2;
+  for(let i=0;i<n-1;i++)
+    rp.push(W(arr[2*i]),0.6,D(arr[2*i+1]), W(arr[2*i+2]),0.6,D(arr[2*i+3]));
+}
+const rgeo=new THREE.BufferGeometry();
+rgeo.setAttribute('position', new THREE.Float32BufferAttribute(rp,3));
+const roadMat=new THREE.ShaderMaterial({
+  uniforms, transparent:true, depthWrite:false, blending:THREE.AdditiveBlending, fog:true,
+  vertexShader:`
+    varying vec3 vW;
+    #include <fog_pars_vertex>
+    void main(){
+      vW=position;
+      vec4 mvPosition=modelViewMatrix*vec4(position,1.0);
+      gl_Position=projectionMatrix*mvPosition;
+      #include <fog_vertex>
+    }`,
+  fragmentShader:`
+    uniform float uTime,uPulse;
+    varying vec3 vW;
+    #include <fog_pars_fragment>
+    void main(){
+      float d=length(vW.xz);
+      float ph=mod(d-uTime*220.0,2800.0);
+      float w=exp(-abs(ph-200.0)/110.0);
+      vec3 pink=vec3(1.0,0.176,0.584);
+      gl_FragColor=vec4(pink*(0.55+uPulse*0.85*w),0.85);
+      #include <fog_fragment>
+    }`
+});
+scene.add(new THREE.LineSegments(rgeo,roadMat));
+
+// ground
+const ground=new THREE.Mesh(new THREE.PlaneGeometry(30000,30000),
+  new THREE.MeshBasicMaterial({color:0x0b0e13}));
+ground.rotation.x=-Math.PI/2; ground.position.y=-0.6; scene.add(ground);
+
+// ---------- post-processing ----------
+const composer=new THREE.EffectComposer(renderer);
+composer.addPass(new THREE.RenderPass(scene,camera));
+const bloom=new THREE.UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight),0.85,0.45,0.55);
+composer.addPass(bloom);
+
+// ---------- controls ----------
+const controls=new THREE.OrbitControls(camera,renderer.domElement);
+controls.enableDamping=true; controls.dampingFactor=0.08;
+controls.maxPolarAngle=Math.PI/2-0.02;
+controls.minDistance=60; controls.maxDistance=9000;
+controls.target.set(0,0,0);
+
+// ---------- UI ----------
+let useBloom=true;
+document.getElementById('cbBloom').addEventListener('change',e=>useBloom=e.target.checked);
+document.getElementById('cbScan').addEventListener('change',e=>uniforms.uScan.value=e.target.checked?1:0);
+document.getElementById('cbPulse').addEventListener('change',e=>uniforms.uPulse.value=e.target.checked?1:0);
+document.getElementById('counts').textContent=
+  `${P.meta.nBld.toLocaleString()} buildings · ${P.meta.nRoad.toLocaleString()} road segments · ${tris.toLocaleString()} triangles`;
+
+addEventListener('resize',()=>{
+  camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight); composer.setSize(innerWidth,innerHeight);
+});
+
+const clock=new THREE.Clock();
+(function loop(){
+  requestAnimationFrame(loop);
+  uniforms.uTime.value=clock.getElapsedTime();
+  uniforms.uCam.value.copy(camera.position);
+  controls.update();
+  if(useBloom) composer.render(); else renderer.render(scene,camera);
+})();
+</script>
+</body>
+</html>
